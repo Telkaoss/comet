@@ -2,138 +2,156 @@ import aiohttp
 import asyncio
 
 from RTN import parse
+
 from comet.utils.general import is_video
 from comet.utils.logger import logger
+from comet.utils.models import settings
 
 
-class DebridLink:
-    def __init__(self, session: aiohttp.ClientSession, debrid_api_key: str):
+class RealDebrid:
+    def __init__(self, session: aiohttp.ClientSession, debrid_api_key: str, ip: str):
         session.headers["Authorization"] = f"Bearer {debrid_api_key}"
         self.session = session
+        self.ip = ip
         self.proxy = None
-        self.api_url = "https://debrid-link.com/api/v2"
+
+        self.api_url = "https://api.real-debrid.com/rest/1.0"
 
     async def check_premium(self):
         try:
-            response = await self.session.get(f"{self.api_url}/account/infos")
-            data = await response.json()
-            return data.get("value", {}).get("accountType") == 1
+            check_premium = await self.session.get(f"{self.api_url}/user")
+            check_premium = await check_premium.text()
+            if '"type": "premium"' in check_premium:
+                return True
         except Exception as e:
-            logger.error(f"Error checking premium status on Debrid-Link: {e}")
-            return False
-
-    async def _process_torrent(self, torrent_hash, type, season, episode, kitsu):
-        try:
-            add_torrent_response = await self.session.post(
-                f"{self.api_url}/seedbox/add",
-                data={"url": torrent_hash, "async": True}
+            logger.warning(
+                f"Exception while checking premium status on Real-Debrid: {e}"
             )
-            add_torrent = await add_torrent_response.json()
 
-            if not add_torrent.get("success"):
-                logger.error(f"Failed to add torrent {torrent_hash}")
-                return None
+        return False
 
-            torrent_id = add_torrent["value"]["id"]
+    async def get_files(
+        self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool
+    ):
+        files = {}
 
-            while True:
-                await asyncio.sleep(1)
+        for torrent_hash in torrent_hashes:
+            try:
+                # Add magnet link
+                add_magnet_response = await self.session.post(
+                    f"{self.api_url}/torrents/addMagnet",
+                    data={"magnet": f"magnet:?xt=urn:btih:{torrent_hash}", "ip": self.ip},
+                    proxy=self.proxy,
+                )
+                add_magnet = await add_magnet_response.json()
+
+                # Get torrent info
                 torrent_info_response = await self.session.get(
-                    f"{self.api_url}/seedbox/list", params={"ids": torrent_id}
+                    f"{self.api_url}/torrents/info/{add_magnet['id']}", proxy=self.proxy
                 )
                 torrent_info = await torrent_info_response.json()
 
-                if not torrent_info.get("success") or not torrent_info["value"]:
-                    logger.error(f"Unable to fetch torrent info for {torrent_id}")
-                    await self.session.delete(f"{self.api_url}/seedbox/{torrent_id}/remove")
-                    return None
-
-                torrent_data = torrent_info["value"][0]
-                status = torrent_data.get("status")
-
-                if status in {6, 100} or torrent_data.get("downloadPercent") == 100:
-                    break
-
-            for index, file in enumerate(torrent_data["files"]):
-                filename = file["name"]
-                if not is_video(filename) or "sample" in filename.lower():
-                    continue
-
-                filename_parsed = parse(filename)
-
-                if type == "series":
-                    if episode not in filename_parsed.episodes:
-                        continue
-                    if kitsu and filename_parsed.seasons:
-                        continue
-                    elif not kitsu and season not in filename_parsed.seasons:
+                # Parse files
+                for file in torrent_info["files"]:
+                    filename = file["path"].lstrip("/")
+                    if not is_video(filename):
                         continue
 
-                await self.session.delete(f"{self.api_url}/seedbox/{torrent_id}/remove")
-                return {
-                    "index": index,
-                    "title": filename,
-                    "size": file["size"],
-                }
+                    if "sample" in filename.lower():
+                        continue
 
-            await self.session.delete(f"{self.api_url}/seedbox/{torrent_id}/remove")
-            return None
+                    filename_parsed = parse(filename)
 
-        except Exception as e:
-            logger.error(f"Error processing torrent {torrent_hash}: {e}")
-            return None
+                    if type == "series":
+                        if episode not in filename_parsed.episodes:
+                            continue
 
-    async def get_files(self, torrent_hashes: list, type: str, season: str, episode: str, kitsu: bool):
-        tasks = [
-            self._process_torrent(torrent_hash, type, season, episode, kitsu)
-            for torrent_hash in torrent_hashes
-        ]
-        results = await asyncio.gather(*tasks)
-        return {
-            torrent_hash: result
-            for torrent_hash, result in zip(torrent_hashes, results)
-            if result is not None
-        }
+                        if kitsu:
+                            if filename_parsed.seasons:
+                                continue
+                        else:
+                            if season not in filename_parsed.seasons:
+                                continue
+
+                    files[torrent_hash] = {
+                        "index": file["id"],
+                        "title": filename,
+                        "size": file["bytes"],
+                    }
+                    break  # Stop after finding the first matching file
+
+                # Optional: Delete the added torrent to prevent clutter
+                await self.session.delete(
+                    f"{self.api_url}/torrents/delete/{add_magnet['id']}", proxy=self.proxy
+                )
+
+            except Exception as e:
+                logger.warning(
+                    f"Exception while processing torrent {torrent_hash}: {e}"
+                )
+
+        return files
 
     async def generate_download_link(self, hash: str, index: str):
         try:
-            add_torrent_response = await self.session.post(
-                f"{self.api_url}/seedbox/add",
-                data={"url": hash, "async": True}
+            check_blacklisted = await self.session.get("https://real-debrid.com/vpn")
+            check_blacklisted = await check_blacklisted.text()
+            if (
+                "Your ISP or VPN provider IP address is currently blocked on our website"
+                in check_blacklisted
+            ):
+                self.proxy = settings.DEBRID_PROXY_URL
+                if not self.proxy:
+                    logger.warning(
+                        "Real-Debrid blacklisted server's IP. No proxy found."
+                    )
+                else:
+                    logger.warning(
+                        f"Real-Debrid blacklisted server's IP. Switching to proxy {self.proxy} for {hash}|{index}"
+                    )
+
+            # Add magnet link
+            add_magnet_response = await self.session.post(
+                f"{self.api_url}/torrents/addMagnet",
+                data={"magnet": f"magnet:?xt=urn:btih:{hash}", "ip": self.ip},
+                proxy=self.proxy,
             )
-            add_torrent = await add_torrent_response.json()
+            add_magnet = await add_magnet_response.json()
 
-            if not add_torrent.get("success"):
-                logger.error(f"Failed to add torrent {hash}")
-                return None
+            # Get torrent info
+            torrent_info_response = await self.session.get(
+                f"{self.api_url}/torrents/info/{add_magnet['id']}", proxy=self.proxy
+            )
+            torrent_info = await torrent_info_response.json()
 
-            torrent_id = add_torrent["value"]["id"]
+            # Select files
+            await self.session.post(
+                f"{self.api_url}/torrents/selectFiles/{add_magnet['id']}",
+                data={"files": index, "ip": self.ip},
+                proxy=self.proxy,
+            )
 
-            while True:
-                await asyncio.sleep(1)
-                torrent_info_response = await self.session.get(
-                    f"{self.api_url}/seedbox/list", params={"ids": torrent_id}
-                )
-                torrent_info = await torrent_info_response.json()
+            # Get updated torrent info
+            torrent_info_response = await self.session.get(
+                f"{self.api_url}/torrents/info/{add_magnet['id']}", proxy=self.proxy
+            )
+            torrent_info = await torrent_info_response.json()
 
-                if not torrent_info.get("success") or not torrent_info["value"]:
-                    logger.error(f"Unable to fetch torrent info for {torrent_id}")
-                    await self.session.delete(f"{self.api_url}/seedbox/{torrent_id}/remove")
-                    return None
+            # Get the download link
+            unrestrict_link_response = await self.session.post(
+                f"{self.api_url}/unrestrict/link",
+                data={"link": torrent_info["links"][0], "ip": self.ip},
+                proxy=self.proxy,
+            )
+            unrestrict_link = await unrestrict_link_response.json()
 
-                torrent_data = torrent_info["value"][0]
-                status = torrent_data.get("status")
+            # Optional: Delete the added torrent to prevent clutter
+            await self.session.delete(
+                f"{self.api_url}/torrents/delete/{add_magnet['id']}", proxy=self.proxy
+            )
 
-                if status in {6, 100} or torrent_data.get("downloadPercent") == 100:
-                    break
-
-            file = torrent_data["files"][int(index)]
-            download_url = file.get("downloadUrl")
-
-            await self.session.delete(f"{self.api_url}/seedbox/{torrent_id}/remove")
-
-            return download_url
-
+            return unrestrict_link["download"]
         except Exception as e:
-            logger.error(f"Error generating download link for {hash}|{index}: {e}")
-            return None
+            logger.warning(
+                f"Exception while getting download link from Real-Debrid for {hash}|{index}: {e}"
+            )
